@@ -13,6 +13,28 @@
 #include <linux/crypto.h>
 #include <linux/kernel.h>
 #include <crypto/hash.h>
+#include <crypto/b128ops.h>
+#include <crypto/internal/skcipher.h>
+#include <crypto/internal/hash.h>
+
+struct mskcipherd_instance_ctx {
+	struct crypto_skcipher_spawn spawn;
+	struct mcryptd_queue *queue;
+};
+
+struct mcryptd_skcipher_ctx {
+	struct crypto_skcipher *child;
+	struct mcryptd_alg_state *alg_state;
+};
+
+struct mcryptd_skcipher {
+	struct crypto_skcipher base;
+};
+
+struct mcryptd_skcipher *mcryptd_alloc_skcipher(const char *alg_name,
+					      u32 type, u32 mask);
+struct crypto_skcipher *mcryptd_skcipher_child(struct mcryptd_skcipher *tfm);
+void mcryptd_free_skcipher(struct mcryptd_skcipher *tfm);
 
 struct mcryptd_ahash {
 	struct crypto_ahash base;
@@ -60,6 +82,19 @@ struct mcryptd_hash_request_ctx {
 	u8 *out;
 	int flag;
 	struct ahash_request areq;
+};
+
+struct mcryptd_skcipher_request_ctx {
+	struct list_head waiter;
+	crypto_completion_t complete;
+	struct mcryptd_tag tag;
+	struct skcipher_walk walk;
+	u8 flag;
+	int nbytes;
+	int error;
+	struct skcipher_request desc;
+	void *job;
+	u128 seq_iv;
 };
 
 struct mcryptd_ahash *mcryptd_alloc_ahash(const char *alg_name,

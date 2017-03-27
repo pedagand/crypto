@@ -28,10 +28,13 @@
 #include <crypto/cryptd.h>
 #include <crypto/internal/simd.h>
 #include <crypto/internal/skcipher.h>
+#include <crypto/mcryptd.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/preempt.h>
 #include <asm/simd.h>
+
+static struct mcryptd_alg_state cbc_mb_alg_state;
 
 struct simd_skcipher_alg {
 	const char *ialg_name;
@@ -40,6 +43,10 @@ struct simd_skcipher_alg {
 
 struct simd_skcipher_ctx {
 	struct cryptd_skcipher *cryptd_tfm;
+};
+
+struct simd_skcipher_ctx_mb {
+	struct mcryptd_skcipher *mcryptd_tfm;
 };
 
 static int simd_skcipher_setkey(struct crypto_skcipher *tfm, const u8 *key,
@@ -202,6 +209,163 @@ out_free_salg:
 	goto out_put_tfm;
 }
 EXPORT_SYMBOL_GPL(simd_skcipher_create_compat);
+
+static int simd_skcipher_setkey_mb(struct crypto_skcipher *tfm, const u8 *key,
+				unsigned int key_len)
+{
+	struct simd_skcipher_ctx_mb *ctx = crypto_skcipher_ctx(tfm);
+	struct crypto_skcipher *child = &ctx->mcryptd_tfm->base;
+	int err;
+
+	crypto_skcipher_clear_flags(child, CRYPTO_TFM_REQ_MASK);
+	crypto_skcipher_set_flags(child, crypto_skcipher_get_flags(tfm) &
+					CRYPTO_TFM_REQ_MASK);
+	err = crypto_skcipher_setkey(child, key, key_len);
+	crypto_skcipher_set_flags(tfm, crypto_skcipher_get_flags(child) &
+					CRYPTO_TFM_RES_MASK);
+	return err;
+}
+
+static int simd_skcipher_decrypt_mb(struct skcipher_request *req)
+{
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct simd_skcipher_ctx_mb *ctx = crypto_skcipher_ctx(tfm);
+	struct skcipher_request *subreq;
+	struct crypto_skcipher *child;
+
+	subreq = skcipher_request_ctx(req);
+	*subreq = *req;
+
+	child = &ctx->mcryptd_tfm->base;
+
+	skcipher_request_set_tfm(subreq, child);
+
+	return crypto_skcipher_decrypt(subreq);
+}
+
+static int simd_skcipher_encrypt_mb(struct skcipher_request *req)
+{
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct simd_skcipher_ctx_mb *ctx = crypto_skcipher_ctx(tfm);
+	struct skcipher_request *subreq;
+	struct crypto_skcipher *child;
+
+	subreq = skcipher_request_ctx(req);
+	*subreq = *req;
+
+	child = &ctx->mcryptd_tfm->base;
+
+	skcipher_request_set_tfm(subreq, child);
+
+	return crypto_skcipher_encrypt(subreq);
+}
+
+static void simd_skcipher_exit_mb(struct crypto_skcipher *tfm)
+{
+	struct simd_skcipher_ctx_mb *ctx = crypto_skcipher_ctx(tfm);
+
+	mcryptd_free_skcipher(ctx->mcryptd_tfm);
+}
+
+static int simd_skcipher_init_mb(struct crypto_skcipher *tfm)
+{
+	struct simd_skcipher_ctx_mb *ctx = crypto_skcipher_ctx(tfm);
+	struct mcryptd_skcipher *mcryptd_tfm;
+	struct simd_skcipher_alg *salg;
+	struct skcipher_alg *alg;
+	unsigned reqsize;
+	struct mcryptd_skcipher_ctx *mctx;
+
+	alg = crypto_skcipher_alg(tfm);
+	salg = container_of(alg, struct simd_skcipher_alg, alg);
+
+	mcryptd_tfm = mcryptd_alloc_skcipher(salg->ialg_name,
+					   CRYPTO_ALG_INTERNAL,
+					   CRYPTO_ALG_INTERNAL);
+	if (IS_ERR(mcryptd_tfm))
+		return PTR_ERR(mcryptd_tfm);
+
+	mctx = crypto_skcipher_ctx(&mcryptd_tfm->base);
+
+	mctx->alg_state = &cbc_mb_alg_state;
+	ctx->mcryptd_tfm = mcryptd_tfm;
+
+	reqsize = sizeof(struct skcipher_request);
+	reqsize += crypto_skcipher_reqsize(&mcryptd_tfm->base);
+
+	crypto_skcipher_set_reqsize(tfm, reqsize);
+
+	return 0;
+}
+
+struct simd_skcipher_alg *simd_skcipher_create_compat_mb(const char *algname,
+							const char *drvname,
+							const char *basename)
+{
+	struct simd_skcipher_alg *salg;
+	struct crypto_skcipher *tfm;
+	struct skcipher_alg *ialg;
+	struct skcipher_alg *alg;
+	int err;
+
+	tfm = crypto_alloc_skcipher(basename, CRYPTO_ALG_INTERNAL,
+				    CRYPTO_ALG_INTERNAL | CRYPTO_ALG_ASYNC);
+	if (IS_ERR(tfm))
+		return ERR_CAST(tfm);
+
+	ialg = crypto_skcipher_alg(tfm);
+
+	salg = kzalloc(sizeof(*salg), GFP_KERNEL);
+	if (!salg) {
+		salg = ERR_PTR(-ENOMEM);
+		goto out_put_tfm;
+	}
+
+	salg->ialg_name = basename;
+	alg = &salg->alg;
+
+	err = -ENAMETOOLONG;
+	if (snprintf(alg->base.cra_name, CRYPTO_MAX_ALG_NAME, "%s", algname) >=
+	    CRYPTO_MAX_ALG_NAME)
+		goto out_free_salg;
+
+	if (snprintf(alg->base.cra_driver_name, CRYPTO_MAX_ALG_NAME, "%s",
+		     drvname) >= CRYPTO_MAX_ALG_NAME)
+		goto out_free_salg;
+
+	alg->base.cra_flags = CRYPTO_ALG_ASYNC;
+	alg->base.cra_priority = ialg->base.cra_priority;
+	alg->base.cra_blocksize = ialg->base.cra_blocksize;
+	alg->base.cra_alignmask = ialg->base.cra_alignmask;
+	alg->base.cra_module = ialg->base.cra_module;
+	alg->base.cra_ctxsize = sizeof(struct simd_skcipher_ctx_mb);
+
+	alg->ivsize = ialg->ivsize;
+	alg->chunksize = ialg->chunksize;
+	alg->min_keysize = ialg->min_keysize;
+	alg->max_keysize = ialg->max_keysize;
+
+	alg->init = simd_skcipher_init_mb;
+	alg->exit = simd_skcipher_exit_mb;
+
+	alg->setkey = simd_skcipher_setkey_mb;
+	alg->encrypt = simd_skcipher_encrypt_mb;
+	alg->decrypt = simd_skcipher_decrypt_mb;
+
+	err = crypto_register_skcipher(alg);
+	if (err)
+		goto out_free_salg;
+
+out_put_tfm:
+	crypto_free_skcipher(tfm);
+	return salg;
+
+out_free_salg:
+	kfree(salg);
+	salg = ERR_PTR(err);
+	goto out_put_tfm;
+}
+EXPORT_SYMBOL_GPL(simd_skcipher_create_compat_mb);
 
 struct simd_skcipher_alg *simd_skcipher_create(const char *algname,
 					       const char *basename)

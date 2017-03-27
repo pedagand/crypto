@@ -273,6 +273,266 @@ static inline bool mcryptd_check_internal(struct rtattr **tb, u32 *type,
 		return false;
 }
 
+static int mcryptd_enqueue_skcipher_request(struct mcryptd_queue *queue,
+				struct crypto_async_request *request,
+				struct mcryptd_skcipher_request_ctx *rctx)
+{
+	int cpu, err;
+	struct mcryptd_cpu_queue *cpu_queue;
+
+	cpu = get_cpu();
+	cpu_queue = this_cpu_ptr(queue->cpu_queue);
+	rctx->tag.cpu = cpu;
+
+	err = crypto_enqueue_request(&cpu_queue->queue, request);
+	pr_debug("enqueue request: cpu %d cpu_queue %p request %p\n",
+		cpu, cpu_queue, request);
+	queue_work_on(cpu, kcrypto_wq, &cpu_queue->work);
+	put_cpu();
+
+	return err;
+}
+
+static int mcryptd_skcipher_setkey(struct crypto_skcipher *parent,
+				const u8 *key, unsigned int keylen)
+{
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(parent);
+	struct crypto_skcipher *child = ctx->child;
+	int err;
+
+	crypto_skcipher_clear_flags(child, CRYPTO_TFM_REQ_MASK);
+	crypto_skcipher_set_flags(child, crypto_skcipher_get_flags(parent) &
+						CRYPTO_TFM_REQ_MASK);
+	err = crypto_skcipher_setkey(child, key, keylen);
+	crypto_skcipher_set_flags(parent, crypto_skcipher_get_flags(child) &
+						CRYPTO_TFM_RES_MASK);
+	return err;
+}
+
+static void mcryptd_skcipher_complete(struct skcipher_request *req, int err)
+{
+	struct mcryptd_skcipher_request_ctx *rctx = skcipher_request_ctx(req);
+
+	local_bh_disable();
+	rctx->complete(&req->base, err);
+	local_bh_enable();
+}
+
+static void mcryptd_skcipher_encrypt(struct crypto_async_request *base,
+								int err)
+{
+	struct skcipher_request *req = skcipher_request_cast(base);
+	struct mcryptd_skcipher_request_ctx *rctx = skcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct crypto_skcipher *child = ctx->child;
+	struct skcipher_request subreq;
+
+	if (unlikely(err == -EINPROGRESS))
+		goto out;
+
+	/* set up the skcipher request to work on */
+	skcipher_request_set_tfm(&subreq, child);
+	skcipher_request_set_callback(&subreq,
+					CRYPTO_TFM_REQ_MAY_SLEEP, 0, 0);
+	skcipher_request_set_crypt(&subreq, req->src, req->dst,
+					req->cryptlen, req->iv);
+
+	/*
+	 * pass addr of descriptor stored in the request context
+	 * so that the callee can get to the request context
+	 */
+	rctx->desc = subreq;
+	err = crypto_skcipher_encrypt(&rctx->desc);
+
+	if (err) {
+		req->base.complete = rctx->complete;
+		goto out;
+	}
+	return;
+
+out:
+	mcryptd_skcipher_complete(req, err);
+}
+
+static void mcryptd_skcipher_decrypt(struct crypto_async_request *base,
+								int err)
+{
+	struct skcipher_request *req = skcipher_request_cast(base);
+	struct mcryptd_skcipher_request_ctx *rctx = skcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct crypto_skcipher *child = ctx->child;
+	struct skcipher_request subreq;
+
+	if (unlikely(err == -EINPROGRESS))
+		goto out;
+
+	/* set up the skcipher request to work on */
+	skcipher_request_set_tfm(&subreq, child);
+	skcipher_request_set_callback(&subreq,
+				CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+	skcipher_request_set_crypt(&subreq, req->src, req->dst,
+						req->cryptlen, req->iv);
+
+	/*
+	 * pass addr of descriptor stored in the request context
+	 * so that the callee can get to the request context
+	 */
+	rctx->desc = subreq;
+	err = crypto_skcipher_decrypt(&rctx->desc);
+
+	if (err) {
+	req->base.complete = rctx->complete;
+	goto out;
+	}
+	return;
+
+out:
+	mcryptd_skcipher_complete(req, err);
+}
+
+static int mcryptd_skcipher_enqueue(struct skcipher_request *req,
+					crypto_completion_t complete)
+{
+	struct mcryptd_skcipher_request_ctx *rctx =
+					skcipher_request_ctx(req);
+	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
+	struct mcryptd_queue *queue;
+
+	queue = mcryptd_get_queue(crypto_skcipher_tfm(tfm));
+	rctx->complete = req->base.complete;
+	req->base.complete = complete;
+
+	return mcryptd_enqueue_skcipher_request(queue, &req->base, rctx);
+}
+
+static int mcryptd_skcipher_encrypt_enqueue(struct skcipher_request *req)
+{
+	return mcryptd_skcipher_enqueue(req, mcryptd_skcipher_encrypt);
+}
+
+static int mcryptd_skcipher_decrypt_enqueue(struct skcipher_request *req)
+{
+	return mcryptd_skcipher_enqueue(req, mcryptd_skcipher_decrypt);
+}
+
+static int mcryptd_skcipher_init_tfm(struct crypto_skcipher *tfm)
+{
+	struct skcipher_instance *inst = skcipher_alg_instance(tfm);
+	struct mskcipherd_instance_ctx *ictx = skcipher_instance_ctx(inst);
+	struct crypto_skcipher_spawn *spawn = &ictx->spawn;
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct crypto_skcipher *cipher;
+
+	cipher = crypto_spawn_skcipher(spawn);
+	if (IS_ERR(cipher))
+		return PTR_ERR(cipher);
+
+	ctx->child = cipher;
+	crypto_skcipher_set_reqsize(tfm,
+			sizeof(struct mcryptd_skcipher_request_ctx));
+	return 0;
+}
+
+static void mcryptd_skcipher_exit_tfm(struct crypto_skcipher *tfm)
+{
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(tfm);
+
+	crypto_free_skcipher(ctx->child);
+}
+
+static void mcryptd_skcipher_free(struct skcipher_instance *inst)
+{
+	struct mskcipherd_instance_ctx *ctx = skcipher_instance_ctx(inst);
+
+	crypto_drop_skcipher(&ctx->spawn);
+}
+
+static int mcryptd_init_instance(struct crypto_instance *inst,
+					struct crypto_alg *alg)
+{
+	if (snprintf(inst->alg.cra_driver_name, CRYPTO_MAX_ALG_NAME,
+		"mcryptd(%s)",
+			alg->cra_driver_name) >= CRYPTO_MAX_ALG_NAME)
+		return -ENAMETOOLONG;
+
+	memcpy(inst->alg.cra_name, alg->cra_name, CRYPTO_MAX_ALG_NAME);
+	inst->alg.cra_priority = alg->cra_priority + 50;
+	inst->alg.cra_blocksize = alg->cra_blocksize;
+	inst->alg.cra_alignmask = alg->cra_alignmask;
+
+	return 0;
+}
+
+static int mcryptd_create_skcipher(struct crypto_template *tmpl,
+				   struct rtattr **tb,
+				   struct mcryptd_queue *queue)
+{
+	struct mskcipherd_instance_ctx *ctx;
+	struct skcipher_instance *inst;
+	struct skcipher_alg *alg;
+	const char *name;
+	u32 type;
+	u32 mask;
+	int err;
+
+	type = 0;
+	mask = CRYPTO_ALG_ASYNC;
+
+	mcryptd_check_internal(tb, &type, &mask);
+
+	name = crypto_attr_alg_name(tb[1]);
+	if (IS_ERR(name))
+		return PTR_ERR(name);
+
+	inst = kzalloc(sizeof(*inst) + sizeof(*ctx), GFP_KERNEL);
+	if (!inst)
+		return -ENOMEM;
+
+	ctx = skcipher_instance_ctx(inst);
+	ctx->queue = queue;
+
+	crypto_set_skcipher_spawn(&ctx->spawn, skcipher_crypto_instance(inst));
+	err = crypto_grab_skcipher(&ctx->spawn, name, type, mask);
+
+	if (err)
+		goto out_free_inst;
+
+	alg = crypto_spawn_skcipher_alg(&ctx->spawn);
+	err = mcryptd_init_instance(skcipher_crypto_instance(inst), &alg->base);
+	if (err)
+		goto out_drop_skcipher;
+
+	inst->alg.base.cra_flags = CRYPTO_ALG_ASYNC |
+				(alg->base.cra_flags & CRYPTO_ALG_INTERNAL);
+
+	inst->alg.ivsize = crypto_skcipher_alg_ivsize(alg);
+	inst->alg.chunksize = crypto_skcipher_alg_chunksize(alg);
+	inst->alg.min_keysize = crypto_skcipher_alg_min_keysize(alg);
+	inst->alg.max_keysize = crypto_skcipher_alg_max_keysize(alg);
+
+	inst->alg.base.cra_ctxsize = sizeof(struct mcryptd_skcipher_ctx);
+
+	inst->alg.init = mcryptd_skcipher_init_tfm;
+	inst->alg.exit = mcryptd_skcipher_exit_tfm;
+
+	inst->alg.setkey = mcryptd_skcipher_setkey;
+	inst->alg.encrypt = mcryptd_skcipher_encrypt_enqueue;
+	inst->alg.decrypt = mcryptd_skcipher_decrypt_enqueue;
+
+	inst->free = mcryptd_skcipher_free;
+
+	err = skcipher_register_instance(tmpl, inst);
+	if (err) {
+out_drop_skcipher:
+	crypto_drop_skcipher(&ctx->spawn);
+out_free_inst:
+	kfree(inst);
+	}
+	return err;
+}
+
 static int mcryptd_hash_init_tfm(struct crypto_tfm *tfm)
 {
 	struct crypto_instance *inst = crypto_tfm_alg_instance(tfm);
@@ -564,6 +824,8 @@ static int mcryptd_create(struct crypto_template *tmpl, struct rtattr **tb)
 		return PTR_ERR(algt);
 
 	switch (algt->type & algt->mask & CRYPTO_ALG_TYPE_MASK) {
+	case CRYPTO_ALG_TYPE_BLKCIPHER:
+		return mcryptd_create_skcipher(tmpl, tb, &mqueue);
 	case CRYPTO_ALG_TYPE_DIGEST:
 		return mcryptd_create_hash(tmpl, tb, &mqueue);
 	break;
@@ -594,6 +856,42 @@ static struct crypto_template mcryptd_tmpl = {
 	.free = mcryptd_free,
 	.module = THIS_MODULE,
 };
+
+struct mcryptd_skcipher *mcryptd_alloc_skcipher(const char *alg_name,
+							u32 type, u32 mask)
+{
+	char cryptd_alg_name[CRYPTO_MAX_ALG_NAME];
+	struct crypto_skcipher *tfm;
+
+	if (snprintf(cryptd_alg_name, CRYPTO_MAX_ALG_NAME,
+		"mcryptd(%s)", alg_name) >= CRYPTO_MAX_ALG_NAME)
+		return ERR_PTR(-EINVAL);
+	tfm = crypto_alloc_skcipher(cryptd_alg_name, type, mask);
+	if (IS_ERR(tfm))
+		return ERR_CAST(tfm);
+	if (tfm->base.__crt_alg->cra_module != THIS_MODULE) {
+		crypto_free_skcipher(tfm);
+		return ERR_PTR(-EINVAL);
+	}
+
+	return container_of(tfm, struct mcryptd_skcipher, base);
+}
+EXPORT_SYMBOL_GPL(mcryptd_alloc_skcipher);
+
+struct crypto_skcipher *mcryptd_skcipher_child(
+			struct mcryptd_skcipher *tfm)
+{
+	struct mcryptd_skcipher_ctx *ctx = crypto_skcipher_ctx(&tfm->base);
+
+	return ctx->child;
+}
+EXPORT_SYMBOL_GPL(mcryptd_skcipher_child);
+
+void mcryptd_free_skcipher(struct mcryptd_skcipher *tfm)
+{
+	crypto_free_skcipher(&tfm->base);
+}
+EXPORT_SYMBOL_GPL(mcryptd_free_skcipher);
 
 struct mcryptd_ahash *mcryptd_alloc_ahash(const char *alg_name,
 					u32 type, u32 mask)

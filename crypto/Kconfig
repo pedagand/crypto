@@ -249,6 +249,7 @@ config CRYPTO_ABLK_HELPER
 config CRYPTO_SIMD
 	tristate
 	select CRYPTO_CRYPTD
+	select CRYPTO_MCRYPTD
 
 config CRYPTO_GLUE_HELPER_X86
 	tristate
@@ -1007,6 +1008,21 @@ config CRYPTO_AES_NI_INTEL
 	  for some popular block cipher mode is supported too, including
 	  ECB, CBC, LRW, PCBC, XTS. The 64 bit version has additional
 	  acceleration for CTR.
+
+config CRYPTO_AES_CBC_MB
+        tristate "AES CBC algorithm (x86_64 Multi-Buffer, Experimental)"
+        depends on X86 && 64BIT
+        select CRYPTO_SIMD
+        select CRYPTO_MCRYPTD
+        help
+          AES CBC encryption implemented using multi-buffer technique.
+          This algorithm computes on multiple data lanes concurrently with
+          SIMD instructions for better throughput. It should only be used
+          when we expect many concurrent crypto requests to keep all the
+          data lanes filled to realize the performance benefit. If the data
+          lanes are unfilled, a flush operation will be initiated after some
+          delay to process the exisiting crypto jobs, adding some extra
+          latency to low load case.
 
 config CRYPTO_AES_SPARC64
 	tristate "AES cipher algorithms (SPARC64)"
