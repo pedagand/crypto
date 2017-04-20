@@ -38,6 +38,7 @@
 #include <linux/jiffies.h>
 #include <linux/timex.h>
 #include <linux/interrupt.h>
+#include <linux/crypto.h>
 #include "tcrypt.h"
 
 /*
@@ -84,7 +85,7 @@ struct tcrypt_result {
 	int err;
 };
 
-static void tcrypt_complete(struct crypto_async_request *req, int err)
+void tcrypt_complete(struct crypto_async_request *req, int err)
 {
 	struct tcrypt_result *res = req->data;
 
@@ -183,6 +184,11 @@ static u32 aead_sizes[] = { 16, 64, 256, 512, 1024, 2048, 4096, 8192, 0 };
 
 #define XBUFSIZE 8
 #define MAX_IVLEN 32
+#define MB_WIDTH 8
+struct scatterlist mb_sg[MB_WIDTH][XBUFSIZE];
+struct skcipher_request *mb_req[MB_WIDTH];
+struct tcrypt_result mb_tresult[MB_WIDTH];
+char *mb_xbuf[MB_WIDTH][XBUFSIZE];
 
 static int testmgr_alloc_buf(char *buf[XBUFSIZE])
 {
@@ -780,6 +786,46 @@ static inline int do_one_acipher_op(struct skcipher_request *req, int ret)
 	return ret;
 }
 
+
+/*
+ * Perform a maximum of MB_WIDTH operations.
+ * Await the results and measure performance.
+ */
+cycles_t mb_start, mb_end;
+static int mb_err[MB_WIDTH];
+
+static inline int do_multi_acipher_op(
+	struct skcipher_request *req[MB_WIDTH], int enc)
+{
+	int i, ret, comp_ret = 0;
+	bool is_async;
+
+	for (i = 0; i < MB_WIDTH; ++i) {
+		ret = enc == ENCRYPT ? crypto_skcipher_encrypt(req[i])
+					: crypto_skcipher_decrypt(req[i]);
+		mb_err[i] = ret;
+		if (ret == -EINPROGRESS || ret == -EBUSY)
+			continue; /* on with next req */
+		/* any other error, bail out */
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < MB_WIDTH; ++i) {
+		struct tcrypt_result *tr = req[i]->base.data;
+
+		is_async = mb_err[i] == -EINPROGRESS || mb_err[i] == -EBUSY;
+		if (is_async) {
+			wait_for_completion(&tr->completion);
+			reinit_completion(&tr->completion);
+		}
+		comp_ret = tr->err;
+		if (comp_ret)
+			pr_info("multi_acipher_op error\n");
+	}
+
+	return comp_ret;
+}
+
 static int test_acipher_jiffies(struct skcipher_request *req, int enc,
 				int blen, int secs)
 {
@@ -927,6 +973,7 @@ static void test_skcipher_speed(const char *algo, int enc, unsigned int secs,
 			if (ret) {
 				pr_err("setkey() failed flags=%x\n",
 					crypto_skcipher_get_flags(tfm));
+
 				goto out_free_req;
 			}
 
@@ -976,6 +1023,203 @@ static void test_skcipher_speed(const char *algo, int enc, unsigned int secs,
 
 out_free_req:
 	skcipher_request_free(req);
+out:
+	crypto_free_skcipher(tfm);
+}
+
+static int test_mb_acipher_jiffies(
+	struct skcipher_request *req[MB_WIDTH], int enc, int blen, int secs)
+{
+	unsigned long start, end;
+	int bcount;
+	int ret;
+
+	/* initiate a maximum of MB_WIDTH operations and measure performance */
+	for (start = jiffies, end = start + secs * HZ, bcount = 0;
+		time_before(jiffies, end); bcount += MB_WIDTH) {
+		ret = do_multi_acipher_op(req, enc);
+		if (ret)
+		return ret;
+	}
+
+	pr_cont("%d operations in %d seconds (%ld bytes)\n",
+		bcount, secs, (long)bcount * blen);
+	return 0;
+}
+
+#define ITR 8
+static int test_mb_acipher_cycles(
+	struct skcipher_request *req[MB_WIDTH], int enc, int blen)
+{
+	cycles_t cycles = 0;
+	int ret = 0;
+	int i;
+
+	/* Warm-up run. */
+	for (i = 0; i < 4; i++) {
+		ret = do_multi_acipher_op(req, enc);
+
+		if (ret)
+			goto out;
+	}
+	/*
+	 * Initiate a maximum of MB_WIDTH operations per loop
+	 * Measure performance over MB_WIDTH iterations
+	 * Let do_multi_acipher_op count the cycles
+	 */
+	for (i = 0; i < ITR; i++) {
+		mb_start = get_cycles();
+		ret = do_multi_acipher_op(req, enc);
+
+		mb_end = get_cycles();
+		cycles += mb_end - mb_start;
+		if (ret)
+			goto out;
+	}
+
+out:
+	if (ret == 0)
+		pr_cont("1 operation in %lu cycles (%d bytes)\n",
+			(cycles + 4) / (ITR*MB_WIDTH), blen);
+
+	return ret;
+}
+
+static void test_mb_acipher_speed(const char *algo, int enc, unsigned int secs,
+				struct cipher_speed_template *template,
+				unsigned int tcount, u8 *keysize)
+{
+	unsigned int ret, i, j, k, iv_len, r;
+	const char *key;
+	char iv[128];
+	struct crypto_skcipher *tfm;
+	const char *e, *driver;
+	u32 *b_size;
+
+	pr_info("test_mb_acipher_speed: test algo %s\n", algo);
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	tfm = crypto_alloc_skcipher(algo, 0, 0);
+
+	if (IS_ERR(tfm)) {
+		pr_err("failed to load transform for %s: %ld\n", algo,
+			PTR_ERR(tfm));
+		return;
+	}
+
+       /* FIXME: do we need to check this? */
+	driver = get_driver_name(crypto_skcipher, tfm);
+	pr_info("\ntesting speed of async %s (%s) %s\n", algo, driver, e);
+
+	/* set up multiple requests for the transform */
+	for (r = 0; r < MB_WIDTH; ++r) {
+		init_completion(&mb_tresult[r].completion);
+		mb_req[r] = skcipher_request_alloc(tfm, GFP_KERNEL);
+		if (!mb_req[r]) {
+			pr_err("tcrypt: skcipher: Failed to allocate request for %s\n",
+					algo);
+			goto out;
+		}
+
+		skcipher_request_set_callback(mb_req[r],
+				CRYPTO_TFM_REQ_MAY_BACKLOG,
+				tcrypt_complete, &mb_tresult[r]);
+	}
+
+	/* loop through different data sizes to encrypt/decrypt */
+	i = 0;
+	do {
+		b_size = block_sizes;
+
+		do {
+			if ((*keysize + *b_size) > TVMEMSIZE * PAGE_SIZE) {
+				pr_err("template (%u) too big for tvmem (%lu)\n",
+				*keysize + *b_size, TVMEMSIZE * PAGE_SIZE);
+				goto out_free_req;
+			}
+
+			pr_info("test %u (%d bit key, %d byte blocks): ", i,
+					*keysize * 8, *b_size);
+
+			memset(tvmem[0], 0xff, PAGE_SIZE);
+
+			/* set key, plain text and IV */
+			key = tvmem[0];
+			for (j = 0; j < tcount; j++) {
+				if (template[j].klen == *keysize) {
+					key = template[j].key;
+					break;
+				}
+			}
+
+			crypto_skcipher_clear_flags(tfm, ~0);
+
+			ret = crypto_skcipher_setkey(tfm, key, *keysize);
+			if (ret) {
+				pr_err("setkey() failed flags=%x keysize=%d\n",
+					crypto_skcipher_get_flags(tfm),
+					*keysize);
+				goto out_free_req;
+			}
+
+			/* set scatter-gather list of data */
+			for (r = 0; r < MB_WIDTH; ++r) {
+				sg_init_table(mb_sg[r], TVMEMSIZE);
+
+				k = *keysize + *b_size;
+				if (k > PAGE_SIZE) {
+					sg_set_buf(mb_sg[r],
+							tvmem[0] + *keysize,
+							PAGE_SIZE - *keysize);
+					k -= PAGE_SIZE;
+					j = 1;
+					while (k > PAGE_SIZE) {
+						sg_set_buf(&mb_sg[r][j],
+							tvmem[j], PAGE_SIZE);
+						memset(tvmem[j], 0xff,
+								PAGE_SIZE);
+						j++;
+						k -= PAGE_SIZE;
+					}
+					sg_set_buf(&mb_sg[r][j], tvmem[j], k);
+					memset(tvmem[j], 0xff, k);
+				} else {
+					sg_set_buf(mb_sg[r],
+						tvmem[0] + *keysize, *b_size);
+				}
+
+				iv_len = crypto_skcipher_ivsize(tfm);
+				if (iv_len)
+					memset(&iv, 0xff, iv_len);
+
+				skcipher_request_set_crypt(mb_req[r],
+						mb_sg[r], mb_sg[r],
+						*b_size, iv);
+			}
+			if (secs)
+				ret = test_mb_acipher_jiffies(mb_req, enc,
+						*b_size, secs);
+			else
+				ret = test_mb_acipher_cycles(mb_req, enc,
+						*b_size);
+
+			if (ret) {
+				pr_err("%s() failed flags=%x\n", e,
+					crypto_skcipher_get_flags(tfm));
+				break;
+			}
+			b_size++;
+			i++;
+		} while (*b_size);
+		keysize++;
+	} while (*keysize);
+
+out_free_req:
+	for (r = 0; r < MB_WIDTH; ++r)
+		skcipher_request_free(mb_req[r]);
 out:
 	crypto_free_skcipher(tfm);
 }
@@ -2037,6 +2281,17 @@ static int do_test(const char *alg, u32 type, u32 mask, int m)
 				   speed_template_8_32);
 		test_acipher_speed("ctr(blowfish)", DECRYPT, sec, NULL, 0,
 				   speed_template_8_32);
+		break;
+
+	case 600:
+		/* Measure performance of aes-cbc multibuffer support */
+		test_mb_acipher_speed("cbc(aes)", ENCRYPT, sec, NULL, 0,
+			speed_template_16_24_32);
+		test_mb_acipher_speed("cbc(aes)", DECRYPT, sec, NULL, 0,
+			speed_template_16_24_32);
+		break;
+	case 601:
+		ret += tcrypt_test("cbc(aes)");
 		break;
 
 	case 1000:

@@ -1,3 +1,4 @@
+
 /*
  * Algorithm testing framework and tests.
  *
@@ -147,6 +148,23 @@ struct alg_test_desc {
 
 static const unsigned int IDX[8] = {
 	IDX1, IDX2, IDX3, IDX4, IDX5, IDX6, IDX7, IDX8 };
+
+#ifdef CONFIG_CRYPTO_AES_CBC_MB
+/*
+ * Indexes into the xbuf to simulate cross-page access for multibuffer tests.
+ */
+#define MB_IDX1                32
+#define MB_IDX2                32400
+#define MB_IDX3                4222
+#define MB_IDX4                8193
+#define MB_IDX5                22222
+#define MB_IDX6                17101
+#define MB_IDX7                27333
+#define MB_IDX8                13222
+static unsigned int MB_IDX[8] = {
+	MB_IDX1, MB_IDX2, MB_IDX3, MB_IDX4,
+	MB_IDX5, MB_IDX6, MB_IDX7, MB_IDX8 };
+#endif /* CONFIG_CRYPTO_AES_CBC_MB */
 
 static void hexdump(unsigned char *buf, unsigned int len)
 {
@@ -1057,6 +1075,8 @@ static int test_cipher(struct crypto_cipher *tfm, int enc,
 			printk(KERN_ERR "alg: cipher: Test %d failed "
 			       "on %s for %s\n", j, e, algo);
 			hexdump(q, template[i].rlen);
+			printk(KERN_ERR "alg: cipher: Test %d expected on %s for %s\n",
+				j, e, algo);
 			ret = -EINVAL;
 			goto out;
 		}
@@ -1069,6 +1089,7 @@ out:
 out_nobuf:
 	return ret;
 }
+
 
 static int __test_skcipher(struct crypto_skcipher *tfm, int enc,
 			   const struct cipher_testvec *template,
@@ -1189,6 +1210,8 @@ static int __test_skcipher(struct crypto_skcipher *tfm, int enc,
 			pr_err("alg: skcipher%s: Test %d failed (invalid result) on %s for %s\n",
 			       d, j, e, algo);
 			hexdump(q, template[i].rlen);
+			pr_err("alg: skcipher%s: Test %d expected %s for %s\n",
+				d, j, e, algo);
 			ret = -EINVAL;
 			goto out;
 		}
@@ -1307,7 +1330,14 @@ static int __test_skcipher(struct crypto_skcipher *tfm, int enc,
 				pr_err("alg: skcipher%s: Chunk test %d failed on %s at page %u for %s\n",
 				       d, j, e, k, algo);
 				hexdump(q, template[i].tap[k]);
+				pr_err(
+	"alg: skcipher%s: Chunk test %d expected on %s at page %u for %s\n",
+					d, j, e, k, algo);
 				goto out;
+			} else {
+				pr_err(
+	"alg: skcipher%s: Chunk test %d succeeded on %s at page %u for %s klen %d\n",
+					d, j, e, k, algo, template[i].klen);
 			}
 
 			q += template[i].tap[k];
@@ -1334,6 +1364,677 @@ out_nooutbuf:
 out_nobuf:
 	return ret;
 }
+
+#ifdef CONFIG_CRYPTO_AES_CBC_MB
+/*
+ * AES CBC multibuffer implementation can encrypt
+ * a maximum of 8 requests at once. Therefore, the
+ * MAX_REQ should be set >= 8 for better performance.
+ * The MAX_XFM allows multiple transforms created within
+ * the test framework.
+ *
+ * The multibuffer tests set up several requests and
+ * hand them off to the multibuffer driver. Error processing
+ * does not simply bail out. The test code walks through all
+ * requests and awaits their completion. Indiscriminate premature
+ * bailout on error while other requests are in progress will cause
+ * trouble.
+ */
+
+#define MAX_REQ        16
+#define MAX_XFM        MAX_REQ
+static struct skcipher_request *mb_req[MAX_REQ][MAX_REQ];
+static struct scatterlist mb_sg[MAX_REQ][MAX_REQ][8];
+static struct scatterlist mb_sgout[MAX_REQ][MAX_REQ][8];
+static struct tcrypt_result mb_result[MAX_REQ][MAX_REQ];
+static char *mb_xbuf[MAX_REQ][MAX_REQ][XBUFSIZE];
+static char *mb_xoutbuf[MAX_REQ][MAX_REQ][XBUFSIZE];
+static int mb_err[MAX_REQ][MAX_REQ];
+static char ivec[MAX_REQ][MAX_REQ][MAX_IVLEN];
+/* random data for cbc multibuffer tests */
+static struct cipher_test_suite mb_cbc_cipher[] = {
+	{
+		{
+			.vecs = aes_cbc_enc_tv_template_rnddata_klenmix,
+			.count = AES_CBC_ENC_TV_TEMPLATE_RNDDATA_KEY16_VEC_COUNT
+		},
+		{
+			.vecs = aes_cbc_dec_tv_template_rnddata_klen16,
+			.count = AES_CBC_DEC_TV_TEMPLATE_RNDDATA_KEY16_VEC_COUNT
+		}
+	},
+};
+
+/*
+ * Test multibuffer version AES CBC crypto algorithm via multiple transforms.
+ * The test iterates through the test vectors sending MAX_REQ requests with
+ * the same vector and IV.
+ */
+
+/* free buffers allocated for testing multibuffer cbc */
+static void free_mbxbuf(int tidx)
+{
+	int i;
+
+	for (i = 0; i < MAX_REQ; ++i) {
+		if (mb_xbuf[tidx][i])
+			testmgr_free_buf(mb_xbuf[tidx][i]);
+	}
+}
+
+/* free MAX_REQ mb_xout buffers for a given transform */
+static void free_mbxoutbuf(int tidx)
+{
+	int i;
+
+	for (i = 0; i < MAX_REQ; ++i) {
+		if (mb_xoutbuf[tidx][i])
+			testmgr_free_buf(mb_xoutbuf[tidx][i]);
+	}
+}
+
+/* free MAX_REQ requests for a given transform */
+static void free_mbreq(int tidx)
+{
+	int i;
+
+	for (i = 0; i < MAX_REQ; ++i)
+		skcipher_request_free(mb_req[tidx][i]);
+}
+
+/* For a given transform, allocate buffers to test multibuffer cbc */
+static int allocbuf_mb(int tidx, struct crypto_skcipher *tfm,
+		       const bool diff_dst, const char *algo)
+{
+	int r, n, err = 0;
+	char *ybuf[XBUFSIZE];
+
+	for (r = 0; r < MAX_REQ; ++r) {
+		if (testmgr_alloc_buf(ybuf))
+			goto out_nobuf;
+
+	for (n = 0; n < XBUFSIZE; ++n)
+		mb_xbuf[tidx][r][n] = ybuf[n];
+
+	if (diff_dst) {
+		if (testmgr_alloc_buf(ybuf))
+			goto out_nooutbuf;
+		for (n = 0; n < XBUFSIZE; ++n)
+			mb_xoutbuf[tidx][r][n] = ybuf[n];
+	}
+
+	init_completion(&mb_result[tidx][r].completion);
+
+	mb_req[tidx][r] = skcipher_request_alloc(
+				tfm,
+				GFP_KERNEL);
+
+	if (!mb_req[tidx][r]) {
+		err = -ENOMEM;
+		pr_err(
+		"alg: __test_skcipher: Failed to allocate request for %s\n",
+			algo);
+		goto out;
+	}
+	skcipher_request_set_callback(mb_req[tidx][r],
+		CRYPTO_TFM_REQ_MAY_BACKLOG,
+		tcrypt_complete, &mb_result[tidx][r]);
+	}
+	return 0;
+
+out:
+	free_mbreq(tidx);
+	if (diff_dst)
+		free_mbxoutbuf(tidx);
+
+out_nooutbuf:
+	free_mbxbuf(tidx);
+
+out_nobuf:
+	return err;
+}
+
+static void set_mb_input(unsigned int tidx, unsigned int vidx,
+			 const struct cipher_testvec *template,
+			 const int align_offset, bool uniq_vec)
+{
+	void *data;
+	const struct cipher_testvec *tvec;
+
+	tvec = &template[vidx] + tidx;
+	data = mb_xbuf[tidx][0][0];
+	data += align_offset;
+	memcpy(data, tvec->input, tvec->ilen);
+}
+
+static void send_mb_req(int tidx, unsigned int vidx, int enc,
+			const bool diff_dst, const int align_offset,
+			const struct cipher_testvec *template, bool uniq_vec,
+			const char *algo)
+{
+	int ret;
+	void *data;
+	const char *iv;
+	char *d, *e;
+	unsigned short ilen;
+	const struct cipher_testvec *tvec;
+	char *thisiv;
+
+	tvec = &template[vidx] + tidx;
+	iv = tvec->iv;
+	ilen = tvec->ilen;
+	if (diff_dst)
+		d = "-ddst";
+	else
+		d = "";
+
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	memset(&mb_err[tidx][0], 0, MAX_REQ); /* no error to begin with */
+
+	data = mb_xbuf[tidx][0][0];
+	data += align_offset;
+	sg_init_one(&mb_sg[tidx][0][0], data, ilen);
+	if (diff_dst) {
+		data = mb_xoutbuf[tidx][0][0];
+		data += align_offset;
+		sg_init_one(&mb_sgout[tidx][0][0], data, ilen);
+	}
+
+	thisiv = ivec[tidx][0];
+	memcpy(thisiv, iv, MAX_IVLEN);
+	skcipher_request_set_crypt(
+			mb_req[tidx][0],
+			mb_sg[tidx][0],
+			(diff_dst) ? mb_sgout[tidx][0]
+			: mb_sg[tidx][0],
+			ilen, thisiv);
+	ret = enc ?
+		crypto_skcipher_encrypt(
+				mb_req[tidx][0])
+		:
+		crypto_skcipher_decrypt(
+				mb_req[tidx][0]);
+
+	if (ret == -EINPROGRESS || ret == -EBUSY || ret == 0) {
+		/* deal with return status properly */
+		mb_err[tidx][0] = ret;
+	} else if (ret) {
+		unsigned int id;
+
+		mb_err[tidx][0] = ret;
+		id = vidx;
+		/* error */
+		pr_err("skcipher%s: %s failed on test %d for %s: ret=%d\n",
+				d, e, id, algo, -ret);
+		pr_err("skcipher%s: req=%d failed\n",
+				d, tidx);
+	}
+}
+
+static void await_mb_result(int tidx)
+{
+	int ret;
+	struct tcrypt_result *tr = &mb_result[tidx][0];
+
+	if (mb_err[tidx][0]) {
+		if (mb_err[tidx][0] != -EINPROGRESS &&
+				       mb_err[tidx][0] != -EBUSY) {
+			pr_err("skcipher error\n"); /* skip reqs that failed */
+			return;
+		}
+		/* wait on async completions */
+		wait_for_completion(&tr->completion);
+		ret = tr->err;
+		mb_err[tidx][0] = ret;
+		if (!ret) {
+			/* no error, on with next */
+			reinit_completion(&tr->completion);
+		} else {
+			pr_err("skcipher: xfm=%d completion error %d\n",
+						tidx, ret);
+		}
+	}
+	/* no wait on synchronous completions */
+}
+
+static void check_mb_result(int tidx, unsigned int vidx, int enc,
+			const bool diff_dst, const int align_offset,
+			const struct cipher_testvec *template, bool uniq_vec,
+			const char *algo)
+{
+	void *data;
+	char *q, *d, *e;
+	const struct cipher_testvec *tvec;
+
+	tvec = &template[vidx] + tidx;
+	if (diff_dst)
+		d = "-ddst";
+	else
+		d = "";
+
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	/* the request resulted in error, move on */
+	if (mb_err[tidx][0])
+		return;
+
+	if (diff_dst) {
+		data = mb_xoutbuf[tidx][0][0];
+		data += align_offset;
+	} else {
+		data = mb_xbuf[tidx][0][0];
+		data += align_offset;
+	}
+	q = data;
+	if (memcmp(q, tvec->result, tvec->rlen)) {
+		pr_err("skcipher%s: Test %d(%d) failed on %s for %s\n",
+				d, tidx, vidx, e, algo);
+		pr_err("skcipher: xfm=%d result mismatch\n",
+				tidx);
+		pr_err("Expected result for xfm=%d\n", tidx);
+		pr_err("Encountered result for xfm=%d\n",
+				tidx);
+	} else {
+		pr_err("skcipher%s: Test %d(%d) succeeded on %s for %s\n",
+				d, tidx, vidx, e, algo);
+	}
+}
+
+static void check_mb_sg_result(int tidx, unsigned int vidx, int enc,
+			bool diff_dst, const struct cipher_testvec *template,
+			bool uniq_vec, const char *algo)
+{
+	unsigned int k, n;
+	unsigned int temp;
+	char *q, *d, *e;
+	const struct cipher_testvec *tvec;
+	unsigned int cor_pg, cor_bytes;
+	unsigned int id; /* test id */
+
+	tvec = &template[vidx] + tidx;
+	if (diff_dst)
+		d = "-ddst";
+	else
+		d = "";
+
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	temp = 0;
+	id = vidx;
+	if (mb_err[tidx][0])
+		return; /* on with other reqs */
+	for (k = 0; k < tvec->np; k++) {
+		unsigned int pg;
+
+		pg = MB_IDX[k] >> PAGE_SHIFT;
+		if (diff_dst)
+			q = mb_xoutbuf[tidx][0][pg] +
+				offset_in_page(MB_IDX[k]);
+		else
+			q = mb_xbuf[tidx][0][pg] +
+				offset_in_page(MB_IDX[k]);
+
+		cor_bytes = tvec->tap[k];
+		cor_pg = k;
+		if (memcmp(q, tvec->result + temp, tvec->tap[k])) {
+			pr_err(
+				"skcipher%s: chunk test %d failed/corruption %s @pg %u for %s:%u bytes:\n",
+					d, id, e, cor_pg, algo, cor_bytes);
+			return;
+		}
+		pr_err(
+			"skcipher%s: chunk test %d succeeded %s @pg %u for %s:%u bytes:\n",
+				d, id, e, cor_pg, algo, cor_bytes);
+
+		q += tvec->tap[k];
+		for (n = 0; offset_in_page(q + n) && q[n]; n++)
+			;
+		if (n) {
+			cor_bytes = n;
+			cor_pg = k;
+			pr_err(
+				"skcipher%s: chunk test %d result corruption %s @pg %u for %s:%u bytes:\n",
+					d, id, e, cor_pg, algo, cor_bytes);
+				break; /* on with next request */
+			}
+		temp += tvec->tap[k];
+	}
+}
+
+static void send_mb_sg_req(int tidx, unsigned int vidx, int enc,
+			bool diff_dst, const struct cipher_testvec *template,
+			bool uniq_vec, const char *algo)
+{
+	unsigned int k, n;
+	unsigned int temp;
+	int ret;
+	char *q, *d, *e;
+	char *ybuf[XBUFSIZE];
+	const struct cipher_testvec *tvec;
+	char *thisiv;
+
+	tvec = &template[vidx] + tidx;
+	if (diff_dst)
+		d = "-ddst";
+	else
+		d = "";
+
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	memset(&mb_err[tidx][0], 0, MAX_REQ);
+
+	temp = 0;
+	sg_init_table(&mb_sg[tidx][0][0], tvec->np);
+	if (diff_dst)
+		sg_init_table(&mb_sgout[tidx][0][0], tvec->np);
+
+	for (k = 0; k < tvec->np; ++k) {
+		unsigned int pg;
+
+		if (WARN_ON((offset_in_page(MB_IDX[k]) + tvec->tap[k]) >
+						PAGE_SIZE)) {
+			pr_err("skcipher%s: %s Invalid sg for %s\n",
+						d, e, algo);
+			pr_err("offset + tap(%d) > PAGE_SIZE(%lu)\n",
+						tvec->tap[k], PAGE_SIZE);
+			pr_err("req=%d k=%d tap(%d)\n",
+						tidx, k, tvec->tap[k]);
+			break;  /* skip this */
+		}
+
+		for (n = 0; n < XBUFSIZE; ++n)
+			ybuf[n] = mb_xbuf[tidx][0][n];
+		pg = MB_IDX[k] >> PAGE_SHIFT;
+		q = ybuf[pg] + offset_in_page(MB_IDX[k]);
+
+		memcpy(q, tvec->input + temp, tvec->tap[k]);
+
+		if ((offset_in_page(q) + tvec->tap[k]) < PAGE_SIZE)
+			q[tvec->tap[k]] = 0;
+
+		sg_set_buf(&mb_sg[tidx][0][k], q, tvec->tap[k]);
+		if (diff_dst) {
+			unsigned int segs;
+
+			segs = tvec->tap[k];
+			q = mb_xoutbuf[tidx][0][pg] +
+				offset_in_page(MB_IDX[k]);
+
+			sg_set_buf(&mb_sgout[tidx][0][k], q, segs);
+
+			memset(q, 0, tvec->tap[k]);
+			if ((offset_in_page(q) + tvec->tap[k]) <
+					PAGE_SIZE)
+				q[segs] = 0;
+		}
+
+		temp += tvec->tap[k];
+	}
+
+	thisiv = ivec[tidx][0];
+	memcpy(thisiv, tvec->iv, MAX_IVLEN);
+	skcipher_request_set_crypt(
+			mb_req[tidx][0],
+			&mb_sg[tidx][0][0],
+			(diff_dst) ? &mb_sgout[tidx][0][0]
+			: &mb_sg[tidx][0][0],
+			tvec->ilen,
+			thisiv);
+
+	ret = enc ? crypto_skcipher_encrypt(
+			mb_req[tidx][0])
+			: crypto_skcipher_decrypt(
+				mb_req[tidx][0]);
+
+	if (ret == -EBUSY || ret == -EINPROGRESS || ret == 0) {
+		/* deal with return status properly */
+		mb_err[tidx][0] = ret;
+		if (uniq_vec)
+			++tvec;
+	} else if (ret) {
+		mb_err[tidx][0] = ret;
+		pr_err("skcipher%s: xfm=%d failed for %s algo %s\n",
+				d, tidx, e, algo);
+	}
+}
+
+static int __test_mb_skcipher(struct crypto_skcipher *tfm[MAX_REQ],
+			      int enc, const struct cipher_testvec *template,
+			      unsigned int tcount,
+			      const bool diff_dst, const int align_offset)
+{
+	const char *algo;
+	unsigned int i, j;
+	const char *e, *d;
+	int ret = -ENOMEM;
+	bool sent[MAX_REQ];
+
+	/* same algorithm, multiple xfms */
+	algo = crypto_tfm_alg_driver_name(
+			crypto_skcipher_tfm(tfm[0]));
+
+	memset(mb_xbuf, '\0', sizeof(mb_xbuf));
+	memset(mb_xoutbuf, '\0', sizeof(mb_xoutbuf));
+
+	for (i = 0; i < MAX_REQ; ++i) {
+		if (allocbuf_mb(i, tfm[i], diff_dst, algo))
+			goto out_nobuf;
+	}
+
+	if (diff_dst)
+		d = "-ddst";
+	else
+		d = "";
+
+	if (enc == ENCRYPT)
+		e = "encryption";
+	else
+		e = "decryption";
+
+	for (i = 0; i < MAX_REQ; ++i)
+		sent[i] = false;
+
+	/* multi xfm, and send multi requests for all xfms and await results */
+	j = 0;
+	for (i = 0; i < tcount; i++) {
+		if (template[i].np && !template[i].also_non_np)
+			continue;
+		/* ensure that the vector data is within page size */
+		if (template[i].ilen > PAGE_SIZE)
+			continue;
+
+		ret = -EINVAL;
+		if (WARN_ON(align_offset + template[i].ilen > PAGE_SIZE))
+			goto out;
+
+		/* set the data for multiple xfms */
+		set_mb_input(i, 0, template,
+				align_offset, false);
+
+		/*
+		 * Set the key for multiple xfms.
+		 * To proceed with test all xfms should be successful
+		 */
+
+		crypto_skcipher_clear_flags(tfm[i], ~0);
+		if (template[i].wk)
+			crypto_skcipher_set_flags(tfm[i],
+					CRYPTO_TFM_REQ_WEAK_KEY);
+
+		ret = crypto_skcipher_setkey(tfm[i], template[i].key,
+				template[i].klen);
+		if (!ret == template[i].fail) {
+			pr_err(
+				"alg: skcipher%s: setkey failed on test %d for %s: flags=%x\n",
+				d, i, algo,
+				crypto_skcipher_get_flags(tfm[i]));
+			goto out;
+		} else if (ret)
+			break;
+		/* move on to next test if key could not be setup */
+		if (ret)
+			continue;
+
+		j++;
+
+		sent[i] = true;
+		send_mb_req(i, 0, enc, diff_dst, align_offset,
+				template, false, algo);
+
+	}
+
+	/* await results from multiple requests from multiple xfms */
+	for (i = 0; i < tcount; ++i) {
+		if (sent[i])
+			await_mb_result(i);
+	}
+
+	/* check results from multiple requests from multiple xfms */
+	for (i = 0; i < tcount; ++i) {
+		if (sent[i])
+			check_mb_result(i, 0, enc, diff_dst,
+					align_offset, template, false, algo);
+		sent[i] = false;
+	}
+
+	j = 0;
+	for (i = 0; i < tcount; i++) {
+		/* alignment tests are only done with continuous buffers */
+
+		if (align_offset != 0)
+			break;
+		if (!template[i].np)
+			continue;
+
+		j++;
+		/* set the key for multiple transforms */
+		crypto_skcipher_clear_flags(tfm[i], ~0);
+		if (template[i].wk)
+			crypto_skcipher_set_flags(
+					tfm[i],
+					CRYPTO_TFM_REQ_WEAK_KEY);
+		ret = crypto_skcipher_setkey(tfm[i], template[i].key,
+				template[i].klen);
+		if (!ret == template[i].fail) {
+			pr_err(
+				"skcipher%s: setkey failed on chunk test %d xfm=%d for %s: flags=%x\n",
+					d, j, i, algo,
+					crypto_skcipher_get_flags(tfm[i]));
+				goto out;
+		} else if (ret)
+			break;
+		if (ret)
+			continue; /* on to next test */
+
+		/* iterate the test over multiple requests & xfms */
+
+		sent[i] = true;
+		send_mb_sg_req(i, 0, enc, diff_dst,
+				       template, false, algo);
+	}
+
+	/* wait for completion from all xfms */
+	for (i = 0; i < tcount; ++i) {
+		if (sent[i])
+			await_mb_result(i);
+	}
+
+	/* check results from all xfms */
+	for (i = 0; i < tcount; ++i) {
+		if (sent[i])
+			check_mb_sg_result(i, 0, enc, diff_dst,
+					template, false, algo);
+	}
+
+	ret = 0;
+
+out:
+	for (i = 0; i < MAX_REQ; ++i)
+		free_mbreq(i);
+
+	if (diff_dst) {
+		for (i = 0; i < MAX_REQ; ++i)
+			free_mbxoutbuf(i);
+	}
+	for (i = 0; i < MAX_REQ; ++i)
+		free_mbxbuf(i);
+
+out_nobuf:
+	return ret;
+}
+
+static int test_mb_skcipher(struct crypto_skcipher *tfm[MAX_XFM],
+			    int enc, const struct cipher_testvec *template,
+			    unsigned int tcount)
+{
+	int ret;
+
+	/* test 'dst == src' case */
+	ret = __test_mb_skcipher(tfm, enc, template, tcount, false, 0);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int alg_test_mb_skcipher(const struct alg_test_desc *desc,
+				const char *driver, u32 type, u32 mask)
+{
+	struct crypto_skcipher *tfm[MAX_REQ];
+	int err = 0;
+	int i;
+
+	/* create multiple transforms to test AES CBC */
+	for (i = 0; i < MAX_REQ; i++) {
+		tfm[i] = crypto_alloc_skcipher(driver,
+					type | CRYPTO_ALG_INTERNAL, mask);
+		if (IS_ERR(tfm[i])) {
+			printk(KERN_ERR "alg: skcipher: Failed to load transform for %s: %ld\n",
+					driver, PTR_ERR(tfm[i]));
+			return PTR_ERR(tfm[i]);
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(mb_cbc_cipher); ++i) {
+		err = test_mb_skcipher(
+				tfm,
+				ENCRYPT,
+				mb_cbc_cipher[i].enc.vecs,
+				mb_cbc_cipher[i].enc.count
+				);
+		if (err)
+			goto out;
+
+		err = test_mb_skcipher(
+				tfm,
+				DECRYPT,
+				mb_cbc_cipher[i].dec.vecs,
+				mb_cbc_cipher[i].dec.count
+				);
+		if (err)
+			goto out;
+
+	}
+out:
+	for (i = 0; i < MAX_REQ; i++)
+		crypto_free_skcipher(tfm[i]);
+
+	return err;
+}
+#endif /* CONFIG_CRYPTO_AES_CBC_MB */
 
 static int test_skcipher(struct crypto_skcipher *tfm, int enc,
 			 const struct cipher_testvec *template,
@@ -1722,6 +2423,12 @@ static int alg_test_skcipher(const struct alg_test_desc *desc,
 {
 	struct crypto_skcipher *tfm;
 	int err = 0;
+
+	#ifdef CONFIG_CRYPTO_AES_CBC_MB
+	/* invoke the comprehensive cbc multibuffer tests */
+	if (desc->alg && (strcmp(desc->alg, "cbc(aes)") == 0))
+		return alg_test_mb_skcipher(desc, driver, type, mask);
+	#endif
 
 	tfm = crypto_alloc_skcipher(driver, type, mask);
 	if (IS_ERR(tfm)) {
