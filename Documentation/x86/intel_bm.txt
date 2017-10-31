@@ -1,0 +1,216 @@
+Intel(R) Branch Monitoring
+
+Copyright (C) 2017 Intel Corporation
+
+Megha Dey <megha.dey@intel.com>
+Yu-Cheng Yu <yu-cheng.yu@intel.com>
+
+I. Overview
+===========
+
+The Cannonlake family of Intel processors support the branch monitoring
+feature. This feature uses heuristics to detect the occurrence of an ROP
+(Return Oriented Programming) or ROP like(JOP:Jump oriented programming)
+attack. These heuristics are based off certain performance monitoring
+statistics, measured dynamically over a short configurable window period.
+ROP is a malware trend in which the attacker can compromise a return
+pointer held on the stack to redirect execution to a different desired
+instruction.
+
+Support for branch monitoring has been added via Linux kernel perf event
+infrastructure. This feature is enabled by CONFIG_PERF_EVENTS_INTEL_BM.
+
+Once the kernel is compiled with CONFIG_PERF_EVENTS_INTEL_BM=y on a
+Cannonlake system, the following perf events are added which can be viewed
+with perf list:
+  intel_bm/branch-misp/                              [Kernel PMU event]
+  intel_bm/call-ret/                                 [Kernel PMU event]
+  intel_bm/far-branch/                               [Kernel PMU event]
+  intel_bm/indirect-branch-misp/                     [Kernel PMU event]
+  intel_bm/ret-misp/                                 [Kernel PMU event]
+  intel_bm/rets/                                     [Kernel PMU event]
+
+II. Hardware details
+====================
+
+The MSRs associated with branch monitoring are as follows:
+
+1. BR_DETECT_CTRL : Branch Monitoring Global control
+   Used for enabling and configuring global capability
+
+2. BR_DETECT_STATUS : Branch Monitoring Global Status
+   Used by SW handler for determining detect status
+
+3. BR_DETECT_COUNTER_CONFIG_i : Branch Monitoring Counter Configuration
+   Per-cpu branch monitoring counter Configuration
+
+There are 2 8-bit counters that each can select between one of the
+following 6 events:
+
+1. RET instructions: Counts the number of near return instructions retired
+
+2. CALL-RET instructions: Counts the difference between the number of near
+   return and call instructions retired
+
+3. RET mispredicts: Mispredicted return instructions retired
+
+4. Branch (all) mispredicts: Counts the number of mispredicted branches
+
+5. Indirect branch mispredicts: Counts the number of mispredicted indirect
+   near branch instructions. Includes indirect near jump/call instructions
+
+6. Far branch instructions: Counts the number of far branches retired
+
+Branch Monitoring hardware utilizes various existing performance related
+counter events. Of the 6 events above, only call-ret is newly implemented.
+
+The events are evaluated over a specified 10-bit instruction window size
+(0 to 1023). For each counter, a threshold value (0 to 127) can be
+configured to set a point at which an interrupt is generated and a
+detection event action is taken (determined by user-space). This can take
+the form of signaling an interrupt and/or freezing the state of the last
+branch record information.
+
+The event counters are reset after every 'window size' instructions by the
+hardware.
+
+The feature is for user mode (privilege level > 0) operation only, which is
+the known malware security threat target environment. While in supervisor
+mode, this heuristic detection counter activity is suspended. This behavior
+(user mode) is independent of root vs. non-root with respect to
+virtualization technology execution.
+
+III. Software Implementation
+============================
+
+A perf-based kernel driver has been used to monitor the occurrence of
+one of the 6 branch monitoring events.
+
+If an branch monitoring interrupt is generated, the interrupt bit is set
+which is cleared by interrupt handler and the event counters are reset.
+
+The entire system can monitor a maximum of 2 events at any given time.
+These events can belong to the same or different tasks.
+
+Everytime a task is scheduled out, we save current window and count
+associated with the event being monitored. When the task is scheduled next,
+we start counting from previous count associated with this event. Thus, a
+full context switch in this case is not necessary.
+
+The Branch Monitoring exception can be configured as a regular interrupt or
+an NMI. We chain an NMI handler after PMU, because
+1. It will not interfere with PMU events
+2. We only monitor for user-mode events, and this will not delay branch
+   monitoring events for user-mode
+
+We monitor only per-task events. It does not make sense to monitor all tasks
+for an attack. This could generate a lot of false positives.
+
+IV. User-configurable inputs
+============================
+
+Several sysfs entries are provided in /sys/devices/intel_bm/ to configure
+controls for the supported hardware heuristics.
+
+1. LBR freeze: /sys/devices/intel-bm/lbr_freeze
+   possible values are 0 or 1. By default this is disabled(0). When enabled,
+   an LBR freeze is observed on threshold trip
+
+2. Guest Disable: /sys/devices/intel-bm/guest_disable
+   Possible values are 0 or 1. By default it is 0. When set to ‘1’, branch
+   monitoring feature is disabled when operating at VMX non-root operation.
+
+3. Window size: /sys/devices/intel-bm/window_size
+   By default, window size is 1023. It can take values from 0 to 1023. This
+   represents the number of instructions to be executed before the event
+   counters are reset.
+
+4. Window count select: /sys/devices/intel-bm/window_cnt_sel
+   Possible values are:
+   ‘00 = instructions retired
+   ‘01 = branches retired
+   ‘10 = returned instructions retired
+   ‘11 = indirect branch instructions retired
+   By default, it has a value of 0.
+
+5. Count and mode: /sys/devices/intel-bm/cnt_and_mode
+   Possible values are 0 or 1. By default it is 0. When set to ‘1’, the
+   overall event triggering condition is true only if both enabled
+   counter’s threshold conditions are true. When ‘0’, the threshold
+   tripping condition is true if either enabled counter’s threshold is
+   true. If a counter is not enabled, then it does not factor into the
+   AND’ing logic
+
+6. Threshold: /sys/devices/intel-bm/threshold
+   An unsigned value of 0 to 127 is supported. The value 0 of counter
+   threshold will result in branch monitoring event signaled after every
+   instruction. By default, it has a value of 127.
+
+7. Mispredict counting behaviour: /sys/devices/intel-bm/mispred_evt_cnt
+   Possible values are:
+   0 = mispredict events are counted in a window
+   1 = mispredict events are counted based on a consecutive occurrence.
+   By default, it has a value of 0.
+
+Threshold and Mispredict events counting behaviour are per-counter
+configurations whereas the rest are global.
+
+V. Example usage
+================
+
+1. To monitor a user space application for branch monitoring events, perf
+command line can be used as follows:
+
+perf stat -e intel_bm/rets/ ./test
+
+ Performance counter stats for './test':
+
+                 1      intel_bm/rets/
+
+       0.104705937 seconds time elapsed
+
+where test.c is:
+
+void func(void)
+{
+        return;
+}
+
+void main(void)
+{
+        int i;
+
+        for (i = 0; i < 128; i++) {
+                func();
+        }
+
+        return;
+}
+
+and threshold = 100 (echo 100 > /sys/devices/intel_bm/threshold)
+
+perf returns the number of branch monitoring interrupts occurred when the
+user-space application was running.
+
+2. To monitor 2 events for a task,
+
+perf stat -e intel_bm/far-branch/,intel_bm/rets/ ./rets-128.bin
+
+ Performance counter stats for './rets-128.bin':
+
+                 0      intel_bm/far-branch/
+                 1      intel_bm/rets/
+
+       0.104057608 seconds time elapsed
+
+For the above example, the threshold and window size are shared.
+
+3. To monitor 2 events with different thresholds(same or different task)
+
+On terminal 1:
+echo <threshold1> > /sys/devices/intel_bm/threshold
+perf stat -e intel_bm/rets/ ./test.bin
+
+On terminal 2:
+echo <threshold2> > /sys/devices/intel_bm/threshold
+perf stat -e intel_bm/call-ret/ ./test.bin
