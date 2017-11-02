@@ -168,6 +168,12 @@ struct hw_perf_event {
 	 */
 	struct task_struct		*target;
 
+	struct { /* intel_bm */
+			u64 bm_ctrl;
+			u64 bm_counter_conf;
+			atomic_t bm_poll;
+	};
+
 	/*
 	 * PMU would store hardware filter configuration
 	 * here.
@@ -191,7 +197,6 @@ struct hw_perf_event {
 	 * local64_cmpxchg() such that pmu::read() can be called nested.
 	 */
 	local64_t			prev_count;
-
 	/*
 	 * The period to start the next sample with.
 	 */
@@ -512,6 +517,7 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
  */
 #define PERF_EV_CAP_SOFTWARE		BIT(0)
 #define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
+#define PERF_EV_CAP_BM			BIT(2)
 
 #define SWEVENT_HLIST_BITS		8
 #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)

@@ -4596,6 +4596,11 @@ static unsigned int perf_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &event->waitq, wait);
 
+	if (event->event_caps & PERF_EV_CAP_BM) {
+		events = atomic_xchg(&event->hw.bm_poll, 0);
+		return events;
+	}
+
 	if (is_event_hup(event))
 		return events;
 
@@ -5497,6 +5502,9 @@ static inline struct fasync_struct **perf_event_fasync(struct perf_event *event)
 void perf_event_wakeup(struct perf_event *event)
 {
 	ring_buffer_wakeup(event);
+
+	if (event->event_caps & PERF_EV_CAP_BM)
+		wake_up_all(&event->waitq);
 
 	if (event->pending_kill) {
 		kill_fasync(perf_event_fasync(event), SIGIO, event->pending_kill);

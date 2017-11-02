@@ -9,6 +9,16 @@ config PERF_EVENTS_INTEL_UNCORE
 	Include support for Intel uncore performance events. These are
 	available on NehalemEX and more modern processors.
 
+config PERF_EVENTS_INTEL_BM
+	bool "Intel Branch Monitoring support"
+	depends on PERF_EVENTS && CPU_SUP_INTEL && PCI
+	---help---
+	  Include support for Intel Branch monitoring. This feature utilizes
+	  heuristics for detecting ROP(Return oriented programming) like
+	  attacks. These heuristics are based off certain performance
+	  monitoring statistics, measured dynamically over a short
+	  configurable window period.
+
 config PERF_EVENTS_INTEL_RAPL
 	tristate "Intel rapl performance events"
 	depends on PERF_EVENTS && CPU_SUP_INTEL && PCI

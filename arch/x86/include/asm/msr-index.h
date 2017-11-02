@@ -294,6 +294,11 @@
 /* Alternative perfctr range with full access. */
 #define MSR_IA32_PMC0			0x000004c1
 
+/* Intel Branch Monitoring MSRs */
+#define BR_DETECT_CONTROL_MSR		0x00000350
+#define BR_DETECT_STATUS_MSR		0x00000351
+#define BR_DETECT_COUNTER_CONFIG_BASE	0x00000354
+
 /* AMD64 MSRs. Not complete. See the architecture manual for a more
    complete list. */
 
